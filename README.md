@@ -26,6 +26,10 @@ A segment with no new Shot receives the preceding AV context plus the Shot activ
 
 Every segment uses the same `noise_seed`. Its local timeline prompt and preceding AV latent context provide the changes between segments.
 
+Standalone `ref_audio_*` inputs support two modes. `ref_audio_mode=full` preserves the original behavior and reuses each complete clip in every segment, which is appropriate for a voice or timbre reference. `ref_audio_mode=timeline` treats each clip as a master-timeline driving track. Before every sampling pass it crops the audio to that segment's global time range, prepends the source range corresponding to the removable 22/39-frame AV guide, and includes any H3-grid tail padding. Missing source samples before time zero or after the end of the track are padded with silence. This mode applies only to standalone audio references; soundtracks attached to reference videos remain full semantic references.
+
+Timeline slicing aligns the reference window presented to each Ref2VA pass, but MiniMax H3 still generates a new AV latent and does not copy the source waveform. Use the original source track when muxing the final master if exact audio preservation is required.
+
 `max_raw_frames` is the H3-grid value produced from the intended segment duration `a` by `n=max(5, round(a*24)); n+(5-n%17)%17`. The node reverses common whole-second values for the master windows: 73 = 3 seconds, 107 = 4 seconds, 124 = 5 seconds, and 362 = 15 seconds. The same reversal is applied to `length`, so both 720 and its grid-encoded form 736 mean a 30-second master. With 362, either form produces exactly two windows, 0-15 and 15-30 seconds. The continuation guide and H3 padding are added only to the internal raw LATENT; they do not shorten or shift the prompt window.
 
 The exact prompt sent to each sampling pass is saved beside the latent checkpoints as `prompts/segment_NNNN.txt`. The manifest records the delivered timeline and prompt window for each segment.

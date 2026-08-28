@@ -26,6 +26,7 @@ from comfy_extras import nodes_minimax_h3 as h3
 from comfy_extras.nodes_audio import vae_decode_audio
 from typing_extensions import override
 
+from .audio_timeline import slice_timeline_ref_audios
 from .timeline import (
     FPS,
     Segment,
@@ -36,7 +37,7 @@ from .timeline import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 UPSCALE_SCHEMA_VERSION = 1
 LOOP_UPSCALE_SCHEMA_VERSION = 2
 
@@ -457,6 +458,15 @@ def _prepare_references(vae, audio_vae, width, height, frame_count, ref_image_si
             "audio_latent": audio_latent,
         })
 
+    audio_items, audio_blocks = _prepare_audio_references(audio_vae, ref_audios)
+    ref_items.extend(audio_items)
+    ref_blocks.extend(audio_blocks)
+    return ref_items, ref_blocks
+
+
+def _prepare_audio_references(audio_vae, ref_audios):
+    ref_items = []
+    ref_blocks = []
     for audio in (ref_audios or {}).values():
         if audio is None:
             continue
@@ -593,7 +603,7 @@ def _update_runtime_hash(digest, value):
 
 
 def _generation_fingerprint(graph_prompt, unique_id, model, clip, sampler, sigmas,
-                            ref_image_size, initial_latent, ref_images, ref_videos,
+                            ref_image_size, ref_audio_mode, initial_latent, ref_images, ref_videos,
                             ref_video_audios, ref_audios):
     payload = {
         "schema": SCHEMA_VERSION,
@@ -602,6 +612,7 @@ def _generation_fingerprint(graph_prompt, unique_id, model, clip, sampler, sigma
         "clip_type": _stable_descriptor(clip),
         "sampler": _sampler_descriptor(sampler),
         "ref_image_size": ref_image_size,
+        "ref_audio_mode": ref_audio_mode,
     }
     digest = hashlib.sha256(json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
@@ -679,8 +690,9 @@ def _validate_preserved_segments(segment_paths, segments, local_prompts, reroll_
         predecessor_lineage = lineage
 
 
-def _manifest_segment(segment, status, checkpoint, prompt_hash, seed, lineage):
-    return {
+def _manifest_segment(segment, status, checkpoint, prompt_hash, seed, lineage,
+                      ref_audio_mode="full"):
+    entry = {
         "index": segment.index,
         "status": status,
         "file": checkpoint.name,
@@ -697,6 +709,12 @@ def _manifest_segment(segment, status, checkpoint, prompt_hash, seed, lineage):
         "prompt_sha256": prompt_hash,
         "lineage": lineage,
     }
+    if ref_audio_mode == "timeline":
+        entry["ref_audio_window_start"] = (
+            segment.output_start - segment.context_frames) / FPS
+        entry["ref_audio_window_end"] = (
+            segment.output_start - segment.context_frames + segment.raw_frames) / FPS
+    return entry
 
 
 def _decode_segment(vae, audio_vae, latent, raw_frames):
@@ -879,6 +897,13 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
                              tooltip="With resume enabled: -1 resumes the first missing segment; N keeps segments before N and regenerates N onward."),
                 io.Int.Input("crf", default=18, min=0, max=51, step=1, advanced=True),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
+                io.Combo.Input(
+                    "ref_audio_mode", options=["full", "timeline"], default="full",
+                    tooltip=(
+                        "full reuses every standalone ref_audio in every segment. "
+                        "timeline crops each standalone ref_audio to the segment's master "
+                        "time range, including its removable AV context and H3 padding."
+                    )),
                 io.Latent.Input("initial_latent", optional=True,
                                 tooltip="Optional sampled H3 AV latent. Its tail guides a removable head before this node's timeline starts at 0."),
                 io.Autogrow.Input("ref_images", optional=True,
@@ -910,12 +935,15 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, audio_vae, prompt, width, height, length, max_raw_frames,
                 context_frames, noise_seed, sampler, sigmas, cache_name, resume,
-                reroll_from_segment, crf, ref_image_size="match", initial_latent=None,
+                reroll_from_segment, crf, ref_image_size="match", ref_audio_mode="full",
+                initial_latent=None,
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
                 prompt_plan=None):
         if width % 32 or height % 32:
             raise ValueError("width and height must be multiples of 32")
         context_frames = int(context_frames)
+        if ref_audio_mode not in ("full", "timeline"):
+            raise ValueError("ref_audio_mode must be full or timeline")
         initial_video = None
         if initial_latent is not None:
             initial_video, _ = _streams(initial_latent)
@@ -932,7 +960,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         )
         generation_fingerprint = _generation_fingerprint(
             graph_prompt, unique_id, model, clip, sampler, sigmas, ref_image_size,
-            initial_latent, ref_images, ref_videos, ref_video_audios, ref_audios)
+            ref_audio_mode, initial_latent, ref_images, ref_videos,
+            ref_video_audios, ref_audios)
         segments = plan_segments(
             length, context_frames, initial_latent is not None, max_raw_frames)
         delivered_length = sum(segment.output_frames for segment in segments)
@@ -978,6 +1007,7 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             "length_input": length,
             "max_raw_frames": max_raw_frames,
             "context_frames": context_frames,
+            "ref_audio_mode": ref_audio_mode,
             "seed": noise_seed,
             "prompt_source": "plan" if prompt_plan is not None else "master",
             "generation_fingerprint": generation_fingerprint,
@@ -990,6 +1020,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         completed = 0
         ref_items = None
         ref_blocks = None
+        static_ref_items = None
+        static_ref_blocks = None
         latent = None
         conditioning = None
         guider = None
@@ -1011,7 +1043,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
                     previous = cached
                     completed += 1
                     manifest["segments"].append(_manifest_segment(
-                        segment, "reused", checkpoint, prompt_hash, noise_seed, lineage))
+                        segment, "reused", checkpoint, prompt_hash, noise_seed, lineage,
+                        ref_audio_mode))
                     _atomic_json(project / "manifest.json", manifest)
                     predecessor_lineage = lineage
                     continue
@@ -1020,7 +1053,18 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
                         "segment {} no longer matches the current generation inputs; reroll from this segment or earlier".format(segment.index))
 
             generated = True
-            if ref_items is None:
+            if ref_audio_mode == "timeline":
+                if static_ref_items is None:
+                    static_ref_items, static_ref_blocks = _prepare_references(
+                        vae, audio_vae, width, height,
+                        max(item.raw_frames for item in segments), ref_image_size,
+                        ref_images, ref_videos, ref_video_audios, None)
+                sliced_ref_audios = slice_timeline_ref_audios(ref_audios, segment)
+                audio_ref_items, audio_ref_blocks = _prepare_audio_references(
+                    audio_vae, sliced_ref_audios)
+                ref_items = static_ref_items + audio_ref_items
+                ref_blocks = static_ref_blocks + audio_ref_blocks
+            elif ref_items is None:
                 ref_items, ref_blocks = _prepare_references(
                     vae, audio_vae, width, height,
                     max(item.raw_frames for item in segments), ref_image_size,
@@ -1055,7 +1099,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             _save_segment(checkpoint, previous, metadata)
             completed += 1
             manifest["segments"].append(_manifest_segment(
-                segment, "generated", checkpoint, prompt_hash, noise_seed, lineage))
+                segment, "generated", checkpoint, prompt_hash, noise_seed, lineage,
+                ref_audio_mode))
             _atomic_json(project / "manifest.json", manifest)
             predecessor_lineage = lineage
 
@@ -1072,6 +1117,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         cached = None
         ref_items = None
         ref_blocks = None
+        static_ref_items = None
+        static_ref_blocks = None
         model = None
         clip = None
         sampler = None

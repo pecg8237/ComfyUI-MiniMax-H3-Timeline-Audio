@@ -46,6 +46,7 @@ class BackendTests(unittest.TestCase):
         input_ids = [input.id for input in schema.inputs]
         self.assertIn("cache_name", input_ids)
         self.assertIn("prompt_plan", input_ids)
+        self.assertIn("ref_audio_mode", input_ids)
         self.assertNotIn("filename_prefix", input_ids)
         self.assertIn(long_nodes.io.Hidden.prompt, schema.hidden)
         self.assertIn(long_nodes.io.Hidden.extra_pnginfo, schema.hidden)
@@ -144,7 +145,7 @@ class BackendTests(unittest.TestCase):
         def fingerprint(value):
             return long_nodes._generation_fingerprint(
                 value, "10", None, None, "euler", torch.tensor([1.0, 0.0]),
-                "match", None, None, None, None, None)
+                "match", "full", None, None, None, None, None)
 
         first = fingerprint(graph)
         graph["10"]["inputs"]["prompt"] = "changed timeline"
