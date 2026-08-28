@@ -862,7 +862,8 @@ class MiniMaxH3LongPromptPlanner(io.ComfyNode):
 
 
 def _long_reference_sampler_schema(node_id, display_name, description,
-                                   ref_audio_options, ref_audio_default):
+                                   ref_audio_options, ref_audio_default,
+                                   cache_name_default):
     return io.Schema(
             node_id=node_id,
             display_name=display_name,
@@ -888,8 +889,8 @@ def _long_reference_sampler_schema(node_id, display_name, description,
                              tooltip="Noise seed shared by every segment. Timeline prompts and continuation context change between segments."),
                 io.Sampler.Input("sampler"),
                 io.Sigmas.Input("sigmas"),
-                io.String.Input("cache_name", default="h3_long_video",
-                                tooltip="Output-relative bundle folder. Supports Save Video patterns, for example h3_long_video/%seed.seed%/. Existing folders become _2, _3, and so on unless resume is enabled."),
+                io.String.Input("cache_name", default=cache_name_default,
+                                tooltip="Output-relative bundle folder. Supports Save Video patterns. Existing folders become _2, _3, and so on unless resume is enabled."),
                 io.Boolean.Input("resume", default=False,
                                  tooltip="Reuse compatible segment checkpoints. Missing or incompatible later segments are regenerated."),
                 io.Int.Input("reroll_from_segment", default=-1, min=-1, max=999, step=1,
@@ -942,6 +943,7 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             "Segment checkpoints are saved under output/h3_long.",
             ["full", "timeline"],
             "full",
+            "h3_long_video",
         )
 
     @classmethod
@@ -1163,6 +1165,7 @@ class MiniMaxH3LongTimelineAudioSampler(MiniMaxH3LongReferenceSampler):
             "to each segment's master-timeline window.",
             ["timeline"],
             "timeline",
+            "h3_timeline_audio",
         )
 
 

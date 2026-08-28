@@ -12,6 +12,8 @@ installation. It registers only one additional node with a unique internal ID:
 
 The upstream node IDs are not registered by this add-on, so existing RunningHub workflows,
 checkpoints, and shared users remain unaffected.
+The new sampler defaults to the separate `h3_timeline_audio` cache bundle so resume data
+cannot collide with the upstream node's `h3_long_video` bundles.
 
 ## Node
 
