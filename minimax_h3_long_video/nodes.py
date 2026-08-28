@@ -861,14 +861,13 @@ class MiniMaxH3LongPromptPlanner(io.ComfyNode):
             plan, preview, len(plan["segments"]))
 
 
-class MiniMaxH3LongReferenceSampler(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="MiniMaxH3LongReferenceSampler",
-            display_name="MiniMax H3 Long Reference Sampler",
+def _long_reference_sampler_schema(node_id, display_name, description,
+                                   ref_audio_options, ref_audio_default):
+    return io.Schema(
+            node_id=node_id,
+            display_name=display_name,
             category="sampling/minimax",
-            description="Generate a long H3 reference video as sequential AV latent segments. Segment checkpoints are saved under output/h3_long.",
+            description=description,
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip"),
@@ -898,7 +897,7 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
                 io.Int.Input("crf", default=18, min=0, max=51, step=1, advanced=True),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
                 io.Combo.Input(
-                    "ref_audio_mode", options=["full", "timeline"], default="full",
+                    "ref_audio_mode", options=ref_audio_options, default=ref_audio_default,
                     tooltip=(
                         "full reuses every standalone ref_audio in every segment. "
                         "timeline crops each standalone ref_audio to the segment's master "
@@ -930,6 +929,19 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
                 io.String.Output(display_name="master_path"),
                 io.Int.Output(display_name="segment_count"),
             ],
+        )
+
+
+class MiniMaxH3LongReferenceSampler(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return _long_reference_sampler_schema(
+            "MiniMaxH3LongReferenceSampler",
+            "MiniMax H3 Long Reference Sampler",
+            "Generate a long H3 reference video as sequential AV latent segments. "
+            "Segment checkpoints are saved under output/h3_long.",
+            ["full", "timeline"],
+            "full",
         )
 
     @classmethod
@@ -1139,6 +1151,19 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         video = InputImpl.VideoFromFile(str(master_path))
         preview = ui.PreviewVideo([ui.SavedResult(master_path.name, relative_folder, io.FolderType.output)])
         return io.NodeOutput(video, last_latent, str(master_path), completed, ui=preview)
+
+
+class MiniMaxH3LongTimelineAudioSampler(MiniMaxH3LongReferenceSampler):
+    @classmethod
+    def define_schema(cls):
+        return _long_reference_sampler_schema(
+            "MiniMaxH3LongTimelineAudioSampler",
+            "MiniMax H3 Long Timeline Audio Sampler",
+            "Generate long H3 AV segments while slicing standalone reference audio "
+            "to each segment's master-timeline window.",
+            ["timeline"],
+            "timeline",
+        )
 
 
 class MiniMaxH3LongLatentUpscale(io.ComfyNode):
@@ -1697,19 +1722,13 @@ class MiniMaxH3LongUpscaleAssemble(io.ComfyNode):
         return io.NodeOutput(video, last_latent, str(master_path), count, ui=preview)
 
 
-class MiniMaxH3LongVideoExtension(ComfyExtension):
+class MiniMaxH3TimelineAudioExtension(ComfyExtension):
     @override
     async def get_node_list(self):
         return [
-            MiniMaxH3LongPromptPlanner,
-            MiniMaxH3LongReferenceSampler,
-            MiniMaxH3LongLatentUpscale,
-            MiniMaxH3LongUpscalePrepare,
-            MiniMaxH3LongSegmentLoad,
-            MiniMaxH3LongSegmentSave,
-            MiniMaxH3LongUpscaleAssemble,
+            MiniMaxH3LongTimelineAudioSampler,
         ]
 
 
 async def comfy_entrypoint():
-    return MiniMaxH3LongVideoExtension()
+    return MiniMaxH3TimelineAudioExtension()

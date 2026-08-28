@@ -52,6 +52,14 @@ class BackendTests(unittest.TestCase):
         self.assertIn(long_nodes.io.Hidden.extra_pnginfo, schema.hidden)
         self.assertIn(long_nodes.io.Hidden.unique_id, schema.hidden)
 
+        timeline_schema = long_nodes.MiniMaxH3LongTimelineAudioSampler.define_schema()
+        self.assertEqual(timeline_schema.node_id, "MiniMaxH3LongTimelineAudioSampler")
+        self.assertEqual(
+            timeline_schema.display_name,
+            "MiniMax H3 Long Timeline Audio Sampler",
+        )
+        self.assertIn("ref_audio_mode", [input.id for input in timeline_schema.inputs])
+
         planner_schema = long_nodes.MiniMaxH3LongPromptPlanner.define_schema()
         self.assertEqual(planner_schema.outputs[1].id, "preview")
         self.assertTrue(planner_schema.outputs[1].is_output_list)

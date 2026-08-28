@@ -1,12 +1,21 @@
-# ComfyUI-MiniMax-H3-Long-Video
+# ComfyUI-MiniMax-H3-Timeline-Audio
 
-[English](README.md) | [日本語](README_ja.md)
+[English](README.md)
 
-Experimental long-form MiniMax H3 reference-video generation for current ComfyUI.
+Side-by-side MiniMax H3 long-video sampler with master-timeline reference-audio slicing.
+
+This fork is designed to coexist with the upstream
+[`ComfyUI-MiniMax-H3-Long-Video`](https://github.com/palealloy2999-prog/ComfyUI-MiniMax-H3-Long-Video)
+installation. It registers only one additional node with a unique internal ID:
+
+`MiniMaxH3LongTimelineAudioSampler` / `MiniMax H3 Long Timeline Audio Sampler`
+
+The upstream node IDs are not registered by this add-on, so existing RunningHub workflows,
+checkpoints, and shared users remain unaffected.
 
 ## Node
 
-`MiniMax H3 Long Reference Sampler` combines the reference inputs from ComfyUI's built-in `MiniMax H3 Reference to Video` node with custom sampler inputs. It splits a long 24 fps timeline into model-sized AV latent segments, uses 22 or 39 frames of sampled video and audio latent as a frame-zero guide for the next segment, saves every segment to SSD, and decodes the selected checkpoints to one MP4 without retaining the full decoded movie in RAM. Guided frames are generated at the head of each continuation segment and removed from the master video.
+`MiniMax H3 Long Timeline Audio Sampler` combines the reference inputs from ComfyUI's built-in `MiniMax H3 Reference to Video` node with custom sampler inputs. It splits a long 24 fps timeline into model-sized AV latent segments, uses 22 or 39 frames of sampled video and audio latent as a frame-zero guide for the next segment, saves every segment to SSD, and decodes the selected checkpoints to one MP4 without retaining the full decoded movie in RAM. Guided frames are generated at the head of each continuation segment and removed from the master video.
 
 Prompts may use the official base-mode `integrated_multimodal_description:`, the full-reference Ref2VA `detailed_description:`, or a plain `[Shot 1] ... [Shot N] At MM:SS.mmm, ...` timeline. Each Shot starts in the segment containing its global timestamp. If it is still active at a segment boundary, the next segment receives it with an explicit instruction to continue from its current state without replaying its beginning. Segment 0 keeps the master timestamps unchanged. Later prompts simply subtract the segment's master start time; the removable AV guide is preceding context outside that local timestamp clock.
 
@@ -26,7 +35,7 @@ A segment with no new Shot receives the preceding AV context plus the Shot activ
 
 Every segment uses the same `noise_seed`. Its local timeline prompt and preceding AV latent context provide the changes between segments.
 
-Standalone `ref_audio_*` inputs support two modes. `ref_audio_mode=full` preserves the original behavior and reuses each complete clip in every segment, which is appropriate for a voice or timbre reference. `ref_audio_mode=timeline` treats each clip as a master-timeline driving track. Before every sampling pass it crops the audio to that segment's global time range, prepends the source range corresponding to the removable 22/39-frame AV guide, and includes any H3-grid tail padding. Missing source samples before time zero or after the end of the track are padded with silence. This mode applies only to standalone audio references; soundtracks attached to reference videos remain full semantic references.
+The node fixes `ref_audio_mode=timeline`. It treats each standalone `ref_audio_*` clip as a master-timeline driving track. Before every sampling pass it crops the audio to that segment's global time range, prepends the source range corresponding to the removable 22/39-frame AV guide, and includes any H3-grid tail padding. Missing source samples before time zero or after the end of the track are padded with silence. This mode applies only to standalone audio references; soundtracks attached to reference videos remain full semantic references.
 
 Timeline slicing aligns the reference window presented to each Ref2VA pass, but MiniMax H3 still generates a new AV latent and does not copy the source waveform. Use the original source track when muxing the final master if exact audio preservation is required.
 
