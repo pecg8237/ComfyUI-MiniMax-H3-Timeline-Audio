@@ -17,8 +17,8 @@ from minimax_h3_long_video import nodes as long_nodes
 from minimax_h3_long_video import timeline
 from minimax_h3_long_video.nodes import (
     _add_continuation_guide, _expand_cache_name, _load_segment,
-    _lock_continuation_context, _output_paths, _prepare_master_audio,
-    _save_segment, _write_master, MiniMaxH3LongLatentUpscale,
+    _output_paths, _prepare_master_audio, _save_segment, _write_master,
+    MiniMaxH3LongLatentUpscale,
     MiniMaxH3LongSegmentLoad, MiniMaxH3LongSegmentSave,
     MiniMaxH3LongUpscaleAssemble, MiniMaxH3LongUpscalePrepare,
 )
@@ -60,7 +60,14 @@ class BackendTests(unittest.TestCase):
             "MiniMax H3 Long Timeline Audio Sampler",
         )
         self.assertIn("ref_audio_mode", [input.id for input in timeline_schema.inputs])
-        self.assertTrue(long_nodes.MiniMaxH3LongTimelineAudioSampler.lock_continuation_context)
+        self.assertEqual(
+            long_nodes.MiniMaxH3LongTimelineAudioSampler.continuation_context_mode,
+            "guide_output_crossfade",
+        )
+        self.assertEqual(
+            long_nodes.MiniMaxH3LongTimelineAudioSampler.video_crossfade_frames,
+            4,
+        )
         self.assertTrue(long_nodes.MiniMaxH3LongTimelineAudioSampler.use_timeline_master_audio)
 
         planner_schema = long_nodes.MiniMaxH3LongPromptPlanner.define_schema()
@@ -252,35 +259,6 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shorter than context_frames"):
             _add_continuation_guide(conditioning, previous, 22)
 
-    def test_locked_continuation_copies_and_protects_previous_av_tail(self):
-        previous, _ = h3._empty_av_latent(32, 32, 56)
-        target, _ = h3._empty_av_latent(32, 32, 73)
-        previous_video, previous_audio = previous["samples"].unbind()
-        previous_video.copy_(
-            torch.arange(previous_video.numel(), dtype=previous_video.dtype).reshape(
-                previous_video.shape))
-        previous_audio.copy_(
-            torch.arange(previous_audio.numel(), dtype=previous_audio.dtype).reshape(
-                previous_audio.shape))
-
-        locked = _lock_continuation_context(target, previous, 22)
-        target_video, target_audio = locked["samples"].unbind()
-        video_mask, audio_mask = locked["noise_mask"].unbind()
-        video_steps = h3.video_latent_t(22)
-        audio_steps = round(22 / 24 * h3.AUDIO_LATENT_FPS)
-        self.assertTrue(torch.equal(
-            target_video[:, :, :video_steps], previous_video[:, :, -video_steps:]))
-        self.assertTrue(torch.equal(
-            target_audio[..., :audio_steps], previous_audio[..., -audio_steps:]))
-        self.assertEqual(video_mask[:, :, :video_steps].count_nonzero().item(), 0)
-        self.assertEqual(audio_mask[..., :audio_steps].count_nonzero().item(), 0)
-        self.assertEqual(
-            video_mask[:, :, video_steps:].count_nonzero().item(),
-            video_mask[:, :, video_steps:].numel())
-        self.assertEqual(
-            audio_mask[..., audio_steps:].count_nonzero().item(),
-            audio_mask[..., audio_steps:].numel())
-
     def test_master_reference_audio_is_stereo_trimmed_or_padded(self):
         mono = torch.linspace(-0.5, 0.5, 100).reshape(1, 1, 100)
         prepared, rate = _prepare_master_audio(
@@ -340,6 +318,58 @@ class BackendTests(unittest.TestCase):
                 for frame in frames
             ])
             self.assertGreater(decoded.abs().mean().item(), 0.1)
+
+    def test_master_crossfade_anchors_to_next_delivered_frame(self):
+        class DiscontinuousVideoVAE:
+            def decode(self, latent):
+                spans = (1, 4, 4, 4, 4)
+                frame_count = sum(
+                    spans[index % 5] for index in range(latent.shape[2]))
+                if latent.mean().item() < 0.5:
+                    values = torch.zeros(frame_count)
+                else:
+                    values = torch.ones(frame_count)
+                    values[:22] = 0.25
+                return values.reshape(-1, 1, 1, 1).expand(
+                    -1, 32, 32, 3)
+
+        segments = plan_segments(80, 22, False, 73)
+        self.assertGreaterEqual(len(segments), 2)
+        source_audio = {
+            "waveform": torch.zeros((1, 1, round(80 / 24 * 32000))),
+            "sample_rate": 32000,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for segment in segments:
+                latent, _ = h3._empty_av_latent(32, 32, segment.raw_frames)
+                if segment.index:
+                    video, _ = latent["samples"].unbind()
+                    video.fill_(1.0)
+                path = Path(directory) / "segment_{:04d}.safetensors".format(
+                    segment.index)
+                _save_segment(path, latent, {"schema": 1})
+                paths.append(path)
+
+            master = Path(directory) / "master.mp4"
+            _write_master(
+                master, paths, segments, DiscontinuousVideoVAE(), AudioVAE(),
+                32, 32, 18, source_audio=source_audio, crossfade_frames=4)
+
+            import av
+            with av.open(str(master)) as container:
+                frames = [
+                    frame.to_ndarray(format="gray")
+                    for frame in container.decode(video=0)
+                ]
+            boundary = segments[1].output_start
+            self.assertEqual(len(frames), sum(item.output_frames for item in segments))
+            self.assertGreater(frames[boundary - 1].mean(), 220)
+            self.assertLess(
+                abs(float(frames[boundary].mean()) - float(frames[boundary - 1].mean())),
+                3.0,
+            )
 
     def test_manifest_upscale_processes_and_reuses_segments_one_at_a_time(self):
         class FakeUpscaler:
@@ -634,9 +664,10 @@ class BackendTests(unittest.TestCase):
                 for patch in reversed(patches):
                     patch.stop()
 
-    def test_timeline_sampler_locks_continuations_and_muxes_ref_audio_zero(self):
+    def test_timeline_sampler_guides_crossfades_and_muxes_ref_audio_zero(self):
         mask_states = []
         captured_audio = []
+        captured_crossfade = []
 
         class FakeSampler:
             @classmethod
@@ -653,8 +684,9 @@ class BackendTests(unittest.TestCase):
             project = Path(directory)
             (project / "latents").mkdir()
 
-            def fake_master(path, *args, source_audio=None):
+            def fake_master(path, *args, source_audio=None, crossfade_frames=0):
                 captured_audio.append(source_audio)
+                captured_crossfade.append(crossfade_frames)
                 path.write_bytes(b"mp4")
 
             patches = (
@@ -696,10 +728,13 @@ class BackendTests(unittest.TestCase):
                 for patch in reversed(patches):
                     patch.stop()
 
-            self.assertEqual(mask_states, [False, True])
+            self.assertEqual(mask_states, [False, False])
             self.assertEqual(captured_audio, [source_audio])
+            self.assertEqual(captured_crossfade, [4])
             manifest = json.loads((project / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["continuation_context_mode"], "locked")
+            self.assertEqual(
+                manifest["continuation_context_mode"], "guide_output_crossfade")
+            self.assertEqual(manifest["video_crossfade_frames"], 4)
             self.assertEqual(manifest["master_audio_mode"], "reference_audio_0")
 
 

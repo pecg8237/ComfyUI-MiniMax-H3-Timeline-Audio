@@ -37,7 +37,7 @@ from .timeline import (
 )
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 UPSCALE_SCHEMA_VERSION = 1
 LOOP_UPSCALE_SCHEMA_VERSION = 2
 
@@ -501,40 +501,6 @@ def _add_continuation_guide(conditioning, previous, context_frames):
         conditioning, {"minimax_keyframes": keyframes})
 
 
-def _lock_continuation_context(latent, previous, context_frames):
-    """Copy the previous AV tail into a protected head of the new latent.
-
-    MiniMax keyframes are conditioning, not an exact preservation mechanism.  A
-    nested denoise mask keeps the carried video and audio latents unchanged while
-    allowing the rest of the new segment to denoise normally.
-    """
-    target_video, target_audio = _streams(latent)
-    previous_video, previous_audio = _streams(previous)
-    if previous_video.shape[3:] != target_video.shape[3:]:
-        raise ValueError("previous H3 latent resolution does not match the target segment")
-
-    video_steps = h3.video_latent_t(context_frames)
-    audio_steps = round(context_frames / FPS * h3.AUDIO_LATENT_FPS)
-    if (previous_video.shape[2] < video_steps or target_video.shape[2] < video_steps or
-            previous_audio.shape[-1] < audio_steps or target_audio.shape[-1] < audio_steps):
-        raise ValueError("the previous H3 AV latent is shorter than context_frames")
-
-    target_video[:, :, :video_steps].copy_(
-        previous_video[:, :, -video_steps:].to(
-            device=target_video.device, dtype=target_video.dtype))
-    target_audio[..., :audio_steps].copy_(
-        previous_audio[..., -audio_steps:].to(
-            device=target_audio.device, dtype=target_audio.dtype))
-
-    video_mask = torch.ones_like(target_video)
-    audio_mask = torch.ones_like(target_audio)
-    video_mask[:, :, :video_steps] = 0.0
-    audio_mask[..., :audio_steps] = 0.0
-    result = dict(latent)
-    result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
-    return result
-
-
 def _prompt_hash(prompt):
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -808,7 +774,7 @@ def _timeline_master_audio(ref_audios):
 
 
 def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, crf,
-                  source_audio=None):
+                  source_audio=None, crossfade_frames=0):
     temporary = path.with_name("{}.tmp-{}.mp4".format(path.stem, os.getpid()))
     total_frames = sum(segment.output_frames for segment in segments)
     if source_audio is None:
@@ -835,6 +801,7 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
             audio_stream = container.add_stream("aac", rate=sample_rate, layout="stereo")
             video_pts = 0
             audio_pts = 0
+            pending_images = None
 
             def write_images(images):
                 nonlocal video_pts
@@ -860,7 +827,8 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
                 for packet in audio_stream.encode(frame):
                     container.mux(packet)
 
-            for checkpoint, segment in zip(segment_paths, segments):
+            for segment_index, (checkpoint, segment) in enumerate(
+                    zip(segment_paths, segments)):
                 latent, _ = _load_segment(checkpoint)
                 if master_waveform is None:
                     images, audio = _decode_segment(
@@ -898,7 +866,35 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
                 else:
                     output_audio = master_waveform[:, output_start:output_end]
 
-                write_images(output_images)
+                if pending_images is not None:
+                    blend_frames = pending_images.shape[0]
+                    if output_images.shape[0] < 1:
+                        raise ValueError(
+                            "continuation segment has no delivered frame for video crossfade")
+                    output_anchor = output_images[:1].to(device="cpu").expand(
+                        blend_frames, -1, -1, -1)
+                    weights = torch.linspace(
+                        0.0, 1.0, blend_frames,
+                        dtype=output_anchor.dtype,
+                    ).reshape(-1, 1, 1, 1)
+                    write_images(
+                        pending_images * (1.0 - weights) + output_anchor * weights)
+                    pending_images = None
+
+                if crossfade_frames and segment_index + 1 < len(segments):
+                    next_blend_frames = min(
+                        int(crossfade_frames),
+                        segments[segment_index + 1].context_frames,
+                        output_images.shape[0],
+                    )
+                    if next_blend_frames:
+                        write_images(output_images[:-next_blend_frames])
+                        pending_images = output_images[-next_blend_frames:].detach().to(
+                            device="cpu", copy=True)
+                    else:
+                        write_images(output_images)
+                else:
+                    write_images(output_images)
                 write_audio(output_audio)
 
             for packet in video_stream.encode(None):
@@ -1039,7 +1035,8 @@ def _long_reference_sampler_schema(node_id, display_name, description,
 
 
 class MiniMaxH3LongReferenceSampler(io.ComfyNode):
-    lock_continuation_context = False
+    continuation_context_mode = "guide"
+    video_crossfade_frames = 0
     use_timeline_master_audio = False
 
     @classmethod
@@ -1132,8 +1129,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             "length_input": length,
             "max_raw_frames": max_raw_frames,
             "context_frames": context_frames,
-            "continuation_context_mode": (
-                "locked" if cls.lock_continuation_context else "guide"),
+            "continuation_context_mode": cls.continuation_context_mode,
+            "video_crossfade_frames": cls.video_crossfade_frames,
             "ref_audio_mode": ref_audio_mode,
             "master_audio_mode": (
                 "reference_audio_0" if cls.use_timeline_master_audio else "generated"),
@@ -1202,9 +1199,6 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             if segment.context_frames:
                 if previous is None:
                     raise ValueError("a previous H3 AV latent is required for this continuation segment")
-                if cls.lock_continuation_context:
-                    latent = _lock_continuation_context(
-                        latent, previous, segment.context_frames)
             conditioning = _conditioning(clip, local_prompt, ref_items, ref_blocks)
             if segment.context_frames:
                 conditioning = _add_continuation_guide(
@@ -1265,7 +1259,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             _write_master(
                 master_path, segment_paths, segments, vae, audio_vae,
                 width, height, crf,
-                source_audio=master_source_audio)
+                source_audio=master_source_audio,
+                crossfade_frames=cls.video_crossfade_frames)
         else:
             _write_master(
                 master_path, segment_paths, segments, vae, audio_vae,
@@ -1282,7 +1277,8 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
 
 
 class MiniMaxH3LongTimelineAudioSampler(MiniMaxH3LongReferenceSampler):
-    lock_continuation_context = True
+    continuation_context_mode = "guide_output_crossfade"
+    video_crossfade_frames = 4
     use_timeline_master_audio = True
 
     @classmethod
