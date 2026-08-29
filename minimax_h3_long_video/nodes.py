@@ -37,7 +37,7 @@ from .timeline import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 UPSCALE_SCHEMA_VERSION = 1
 LOOP_UPSCALE_SCHEMA_VERSION = 2
 
@@ -501,6 +501,40 @@ def _add_continuation_guide(conditioning, previous, context_frames):
         conditioning, {"minimax_keyframes": keyframes})
 
 
+def _lock_continuation_context(latent, previous, context_frames):
+    """Copy the previous AV tail into a protected head of the new latent.
+
+    MiniMax keyframes are conditioning, not an exact preservation mechanism.  A
+    nested denoise mask keeps the carried video and audio latents unchanged while
+    allowing the rest of the new segment to denoise normally.
+    """
+    target_video, target_audio = _streams(latent)
+    previous_video, previous_audio = _streams(previous)
+    if previous_video.shape[3:] != target_video.shape[3:]:
+        raise ValueError("previous H3 latent resolution does not match the target segment")
+
+    video_steps = h3.video_latent_t(context_frames)
+    audio_steps = round(context_frames / FPS * h3.AUDIO_LATENT_FPS)
+    if (previous_video.shape[2] < video_steps or target_video.shape[2] < video_steps or
+            previous_audio.shape[-1] < audio_steps or target_audio.shape[-1] < audio_steps):
+        raise ValueError("the previous H3 AV latent is shorter than context_frames")
+
+    target_video[:, :, :video_steps].copy_(
+        previous_video[:, :, -video_steps:].to(
+            device=target_video.device, dtype=target_video.dtype))
+    target_audio[..., :audio_steps].copy_(
+        previous_audio[..., -audio_steps:].to(
+            device=target_audio.device, dtype=target_audio.dtype))
+
+    video_mask = torch.ones_like(target_video)
+    audio_mask = torch.ones_like(target_audio)
+    video_mask[:, :, :video_steps] = 0.0
+    audio_mask[..., :audio_steps] = 0.0
+    result = dict(latent)
+    result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+    return result
+
+
 def _prompt_hash(prompt):
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -717,20 +751,80 @@ def _manifest_segment(segment, status, checkpoint, prompt_hash, seed, lineage,
     return entry
 
 
-def _decode_segment(vae, audio_vae, latent, raw_frames):
+def _decode_video_segment(vae, latent, raw_frames):
     video, _ = _streams(latent)
     images = vae.decode(video)
     if images.ndim == 5:
         images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
     if images.shape[0] < raw_frames:
         raise ValueError("video VAE decoded fewer frames than the H3 segment requires")
+    return images[:raw_frames]
+
+
+def _decode_segment(vae, audio_vae, latent, raw_frames):
+    images = _decode_video_segment(vae, latent, raw_frames)
     audio = vae_decode_audio(audio_vae, latent)
-    return images[:raw_frames], audio
+    return images, audio
 
 
-def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, crf):
+def _prepare_master_audio(audio, target_samples):
+    if not isinstance(audio, dict):
+        raise ValueError("master reference audio must be a ComfyUI AUDIO value")
+    waveform = audio.get("waveform")
+    sample_rate = audio.get("sample_rate")
+    if not torch.is_tensor(waveform) or waveform.ndim != 3:
+        raise ValueError(
+            "master reference audio waveform must have shape [batch, channels, samples]")
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError):
+        raise ValueError("master reference audio has an invalid sample_rate")
+    if sample_rate <= 0:
+        raise ValueError("master reference audio sample_rate must be positive")
+
+    waveform = waveform[0].detach().to(device="cpu", dtype=torch.float32)
+    if waveform.shape[0] == 1:
+        waveform = waveform.repeat(2, 1)
+    elif waveform.shape[0] > 2:
+        waveform = waveform[:2]
+    if waveform.shape[0] != 2:
+        raise ValueError("master reference audio must contain at least one channel")
+    if waveform.shape[-1] < target_samples:
+        waveform = torch.nn.functional.pad(
+            waveform, (0, target_samples - waveform.shape[-1]))
+    else:
+        waveform = waveform[:, :target_samples]
+    return waveform.clamp(-1.0, 1.0).contiguous(), sample_rate
+
+
+def _timeline_master_audio(ref_audios):
+    ref_audios = ref_audios or {}
+    audio = ref_audios.get("ref_audio_0")
+    if audio is None:
+        raise ValueError(
+            "MiniMax H3 Long Timeline Audio Sampler requires ref_audio_0; "
+            "it is used both as the timeline reference and as the final master soundtrack")
+    return audio
+
+
+def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, crf,
+                  source_audio=None):
     temporary = path.with_name("{}.tmp-{}.mp4".format(path.stem, os.getpid()))
-    sample_rate = int(getattr(audio_vae, "audio_sample_rate_output", getattr(audio_vae, "audio_sample_rate", 32000)))
+    total_frames = sum(segment.output_frames for segment in segments)
+    if source_audio is None:
+        sample_rate = int(getattr(
+            audio_vae, "audio_sample_rate_output",
+            getattr(audio_vae, "audio_sample_rate", 32000)))
+        master_waveform = None
+    else:
+        source_rate = source_audio.get("sample_rate") if isinstance(source_audio, dict) else None
+        try:
+            source_rate = int(source_rate)
+        except (TypeError, ValueError):
+            raise ValueError("master reference audio has an invalid sample_rate")
+        target_samples = round(total_frames / FPS * source_rate)
+        master_waveform, sample_rate = _prepare_master_audio(
+            source_audio, target_samples)
     try:
         with av.open(str(temporary), mode="w", options={"movflags": "faststart"}) as container:
             video_stream = container.add_stream("h264", rate=Fraction(FPS, 1))
@@ -768,30 +862,41 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
 
             for checkpoint, segment in zip(segment_paths, segments):
                 latent, _ = _load_segment(checkpoint)
-                images, audio = _decode_segment(vae, audio_vae, latent, segment.raw_frames)
+                if master_waveform is None:
+                    images, audio = _decode_segment(
+                        vae, audio_vae, latent, segment.raw_frames)
+                else:
+                    images = _decode_video_segment(vae, latent, segment.raw_frames)
+                    audio = None
                 output_images = images[
                     segment.context_frames:segment.context_frames + segment.output_frames]
 
-                waveform = audio["waveform"]
-                source_rate = int(audio["sample_rate"])
-                if source_rate != sample_rate:
-                    raise ValueError("audio VAE changed sample rate between H3 segments")
-                raw_samples = round(segment.raw_frames / FPS * sample_rate)
-                context_samples = round(segment.context_frames / FPS * sample_rate)
                 output_start = round(segment.output_start / FPS * sample_rate)
                 output_end = round((segment.output_start + segment.output_frames) / FPS * sample_rate)
                 output_samples = output_end - output_start
-                waveform = waveform[0]
-                if waveform.shape[-1] < raw_samples:
-                    waveform = torch.nn.functional.pad(waveform, (0, raw_samples - waveform.shape[-1]))
-                if waveform.shape[0] == 1:
-                    waveform = waveform.repeat(2, 1)
-                elif waveform.shape[0] > 2:
-                    waveform = waveform[:2]
-                waveform = waveform.to(device="cpu")
-                output_audio = waveform[:, context_samples:context_samples + output_samples]
-                if output_audio.shape[-1] < output_samples:
-                    output_audio = torch.nn.functional.pad(output_audio, (0, output_samples - output_audio.shape[-1]))
+                if master_waveform is None:
+                    waveform = audio["waveform"]
+                    decoded_rate = int(audio["sample_rate"])
+                    if decoded_rate != sample_rate:
+                        raise ValueError("audio VAE changed sample rate between H3 segments")
+                    raw_samples = round(segment.raw_frames / FPS * sample_rate)
+                    context_samples = round(segment.context_frames / FPS * sample_rate)
+                    waveform = waveform[0]
+                    if waveform.shape[-1] < raw_samples:
+                        waveform = torch.nn.functional.pad(
+                            waveform, (0, raw_samples - waveform.shape[-1]))
+                    if waveform.shape[0] == 1:
+                        waveform = waveform.repeat(2, 1)
+                    elif waveform.shape[0] > 2:
+                        waveform = waveform[:2]
+                    waveform = waveform.to(device="cpu")
+                    output_audio = waveform[
+                        :, context_samples:context_samples + output_samples]
+                    if output_audio.shape[-1] < output_samples:
+                        output_audio = torch.nn.functional.pad(
+                            output_audio, (0, output_samples - output_audio.shape[-1]))
+                else:
+                    output_audio = master_waveform[:, output_start:output_end]
 
                 write_images(output_images)
                 write_audio(output_audio)
@@ -934,6 +1039,9 @@ def _long_reference_sampler_schema(node_id, display_name, description,
 
 
 class MiniMaxH3LongReferenceSampler(io.ComfyNode):
+    lock_continuation_context = False
+    use_timeline_master_audio = False
+
     @classmethod
     def define_schema(cls):
         return _long_reference_sampler_schema(
@@ -958,6 +1066,9 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         context_frames = int(context_frames)
         if ref_audio_mode not in ("full", "timeline"):
             raise ValueError("ref_audio_mode must be full or timeline")
+        master_source_audio = (
+            _timeline_master_audio(ref_audios)
+            if cls.use_timeline_master_audio else None)
         initial_video = None
         if initial_latent is not None:
             initial_video, _ = _streams(initial_latent)
@@ -1021,7 +1132,11 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             "length_input": length,
             "max_raw_frames": max_raw_frames,
             "context_frames": context_frames,
+            "continuation_context_mode": (
+                "locked" if cls.lock_continuation_context else "guide"),
             "ref_audio_mode": ref_audio_mode,
+            "master_audio_mode": (
+                "reference_audio_0" if cls.use_timeline_master_audio else "generated"),
             "seed": noise_seed,
             "prompt_source": "plan" if prompt_plan is not None else "master",
             "generation_fingerprint": generation_fingerprint,
@@ -1087,6 +1202,9 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             if segment.context_frames:
                 if previous is None:
                     raise ValueError("a previous H3 AV latent is required for this continuation segment")
+                if cls.lock_continuation_context:
+                    latent = _lock_continuation_context(
+                        latent, previous, segment.context_frames)
             conditioning = _conditioning(clip, local_prompt, ref_items, ref_blocks)
             if segment.context_frames:
                 conditioning = _add_continuation_guide(
@@ -1143,7 +1261,15 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
         ref_videos = None
         ref_video_audios = None
         ref_audios = None
-        _write_master(master_path, segment_paths, segments, vae, audio_vae, width, height, crf)
+        if cls.use_timeline_master_audio:
+            _write_master(
+                master_path, segment_paths, segments, vae, audio_vae,
+                width, height, crf,
+                source_audio=master_source_audio)
+        else:
+            _write_master(
+                master_path, segment_paths, segments, vae, audio_vae,
+                width, height, crf)
         last_latent, _ = _load_segment(segment_paths[-1])
         last_latent = _cpu_latent(last_latent)
         manifest["status"] = "complete"
@@ -1156,6 +1282,9 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
 
 
 class MiniMaxH3LongTimelineAudioSampler(MiniMaxH3LongReferenceSampler):
+    lock_continuation_context = True
+    use_timeline_master_audio = True
+
     @classmethod
     def define_schema(cls):
         return _long_reference_sampler_schema(
