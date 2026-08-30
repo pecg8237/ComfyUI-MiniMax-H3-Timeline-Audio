@@ -62,11 +62,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn("ref_audio_mode", [input.id for input in timeline_schema.inputs])
         self.assertEqual(
             long_nodes.MiniMaxH3LongTimelineAudioSampler.continuation_context_mode,
-            "guide_output_crossfade",
-        )
-        self.assertEqual(
-            long_nodes.MiniMaxH3LongTimelineAudioSampler.video_crossfade_frames,
-            4,
+            "author_2026_08_25_guide",
         )
         self.assertTrue(long_nodes.MiniMaxH3LongTimelineAudioSampler.use_timeline_master_audio)
 
@@ -105,14 +101,14 @@ class BackendTests(unittest.TestCase):
             {"segment_prompt_1": "[Shot 1] Manually revised second segment."},
         )
         plan, preview, count = result
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 3)
         self.assertIn("[Shot 2] At 00:03.000, first action", plan["segments"][0]["prompt"])
         self.assertEqual(
             plan["segments"][1]["prompt"],
             "[Shot 1] Manually revised second segment.",
         )
         self.assertIsInstance(preview, list)
-        self.assertEqual(len(preview), 2)
+        self.assertEqual(len(preview), 3)
         self.assertEqual(preview, [entry["prompt"] for entry in plan["segments"]])
         self.assertIn("[Shot 2] At 00:03.000, first action", preview[0])
         self.assertEqual(preview[1], "[Shot 1] Manually revised second segment.")
@@ -318,58 +314,6 @@ class BackendTests(unittest.TestCase):
                 for frame in frames
             ])
             self.assertGreater(decoded.abs().mean().item(), 0.1)
-
-    def test_master_crossfade_anchors_to_next_delivered_frame(self):
-        class DiscontinuousVideoVAE:
-            def decode(self, latent):
-                spans = (1, 4, 4, 4, 4)
-                frame_count = sum(
-                    spans[index % 5] for index in range(latent.shape[2]))
-                if latent.mean().item() < 0.5:
-                    values = torch.zeros(frame_count)
-                else:
-                    values = torch.ones(frame_count)
-                    values[:22] = 0.25
-                return values.reshape(-1, 1, 1, 1).expand(
-                    -1, 32, 32, 3)
-
-        segments = plan_segments(80, 22, False, 73)
-        self.assertGreaterEqual(len(segments), 2)
-        source_audio = {
-            "waveform": torch.zeros((1, 1, round(80 / 24 * 32000))),
-            "sample_rate": 32000,
-        }
-
-        with tempfile.TemporaryDirectory() as directory:
-            paths = []
-            for segment in segments:
-                latent, _ = h3._empty_av_latent(32, 32, segment.raw_frames)
-                if segment.index:
-                    video, _ = latent["samples"].unbind()
-                    video.fill_(1.0)
-                path = Path(directory) / "segment_{:04d}.safetensors".format(
-                    segment.index)
-                _save_segment(path, latent, {"schema": 1})
-                paths.append(path)
-
-            master = Path(directory) / "master.mp4"
-            _write_master(
-                master, paths, segments, DiscontinuousVideoVAE(), AudioVAE(),
-                32, 32, 18, source_audio=source_audio, crossfade_frames=4)
-
-            import av
-            with av.open(str(master)) as container:
-                frames = [
-                    frame.to_ndarray(format="gray")
-                    for frame in container.decode(video=0)
-                ]
-            boundary = segments[1].output_start
-            self.assertEqual(len(frames), sum(item.output_frames for item in segments))
-            self.assertGreater(frames[boundary - 1].mean(), 220)
-            self.assertLess(
-                abs(float(frames[boundary].mean()) - float(frames[boundary - 1].mean())),
-                3.0,
-            )
 
     def test_manifest_upscale_processes_and_reuses_segments_one_at_a_time(self):
         class FakeUpscaler:
@@ -631,8 +575,8 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(manifest["latent_format"], "minimax_h3_av")
                 self.assertEqual(manifest["schema"], long_nodes.SCHEMA_VERSION)
                 self.assertIn("generation_fingerprint", manifest)
-                self.assertEqual(manifest["segments"][1]["output_start"], 336)
-                self.assertEqual(manifest["segments"][1]["output_frames"], 24)
+                self.assertEqual(manifest["segments"][1]["output_start"], 345)
+                self.assertEqual(manifest["segments"][1]["output_frames"], 15)
 
                 second = long_nodes.MiniMaxH3LongReferenceSampler.execute(
                     None, None, VideoVAE(), AudioVAE(), "A continuous shot", 32, 32, 360,
@@ -664,10 +608,9 @@ class BackendTests(unittest.TestCase):
                 for patch in reversed(patches):
                     patch.stop()
 
-    def test_timeline_sampler_guides_crossfades_and_muxes_ref_audio_zero(self):
+    def test_timeline_sampler_uses_author_guide_and_muxes_ref_audio_zero(self):
         mask_states = []
         captured_audio = []
-        captured_crossfade = []
 
         class FakeSampler:
             @classmethod
@@ -684,9 +627,8 @@ class BackendTests(unittest.TestCase):
             project = Path(directory)
             (project / "latents").mkdir()
 
-            def fake_master(path, *args, source_audio=None, crossfade_frames=0):
+            def fake_master(path, *args, source_audio=None):
                 captured_audio.append(source_audio)
-                captured_crossfade.append(crossfade_frames)
                 path.write_bytes(b"mp4")
 
             patches = (
@@ -730,11 +672,10 @@ class BackendTests(unittest.TestCase):
 
             self.assertEqual(mask_states, [False, False])
             self.assertEqual(captured_audio, [source_audio])
-            self.assertEqual(captured_crossfade, [4])
             manifest = json.loads((project / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                manifest["continuation_context_mode"], "guide_output_crossfade")
-            self.assertEqual(manifest["video_crossfade_frames"], 4)
+                manifest["continuation_context_mode"], "author_2026_08_25_guide")
+            self.assertNotIn("video_crossfade_frames", manifest)
             self.assertEqual(manifest["master_audio_mode"], "reference_audio_0")
 
 

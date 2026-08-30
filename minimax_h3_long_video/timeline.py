@@ -1,9 +1,10 @@
+import math
 import re
 from dataclasses import dataclass
 
 
 FPS = 24
-PROMPT_PLAN_SCHEMA_VERSION = 1
+PROMPT_PLAN_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -20,22 +21,8 @@ class Segment:
 
     @property
     def prompt_end_seconds(self):
-        return (self.output_start + self.output_frames) / FPS
-
-
-def _h3_grid_frames(minimum_frames):
-    frames = max(5, int(minimum_frames))
-    return frames + ((5 - frames) % 17)
-
-
-def _segment_output_frames(max_raw_frames):
-    """Reverse the common whole-second input before its 17k+5 padding."""
-    nearest_seconds = round(max_raw_frames / FPS)
-    for seconds in (nearest_seconds, nearest_seconds - 1, nearest_seconds + 1):
-        whole_seconds_frames = seconds * FPS
-        if seconds > 0 and _h3_grid_frames(whole_seconds_frames) == max_raw_frames:
-            return whole_seconds_frames
-    return max_raw_frames
+        return self.prompt_start_seconds + (
+            self.raw_frames - self.context_frames) / FPS
 
 
 def plan_segments(output_frames, context_frames, has_initial_latent, max_raw_frames):
@@ -45,20 +32,27 @@ def plan_segments(output_frames, context_frames, has_initial_latent, max_raw_fra
         raise ValueError("context_frames must be 22 or 39")
     if max_raw_frames < 5 or max_raw_frames % 17 != 5:
         raise ValueError("max_raw_frames must use the MiniMax H3 17k+5 frame grid")
-
-    # max_raw_frames selects a human-scale timeline window. For example, 362
-    # frames means a 15-second master window, not a 15.083-second prompt cut.
-    # The removable AV guide and H3 grid padding are internal generation detail.
-    segment_frames = _segment_output_frames(max_raw_frames)
+    if max_raw_frames <= context_frames:
+        raise ValueError("max_raw_frames must be greater than context_frames")
 
     segments = []
-    remaining = _segment_output_frames(int(output_frames))
+    remaining = int(output_frames)
     output_start = 0
     index = 0
     while remaining:
         context = context_frames if has_initial_latent or index else 0
-        delivered = min(remaining, segment_frames)
-        raw_frames = _h3_grid_frames(context + delivered)
+        if context:
+            capacity = max_raw_frames - context
+            wanted = min(remaining, capacity)
+            generated = math.ceil(wanted / 17) * 17
+            raw_frames = context + generated
+        else:
+            raw_frames = min(remaining, max_raw_frames)
+            while raw_frames % 17 != 5:
+                raw_frames += 1
+            generated = raw_frames
+
+        delivered = min(remaining, generated)
         segments.append(Segment(index, raw_frames, context, output_start, delivered))
         remaining -= delivered
         output_start += delivered
@@ -122,15 +116,14 @@ def _timestamp_millis(seconds):
 
 def _guide_instruction(context_seconds, active_text=""):
     instruction = (
-        "The supplied AV guide is preceding context and is outside this segment's "
-        "timestamp clock. Segment time 00:00.000 begins immediately after the guide's "
-        "final moment. Continue forward without repeating the guided action."
-    )
+        "[Shot 1] For the first {:.3f} seconds, follow the supplied AV guide exactly. "
+        "The guide is preceding context only. At {}, continue forward from its final moment "
+        "with new motion and do not repeat the guided action."
+    ).format(context_seconds, format_timestamp(context_seconds))
     if active_text:
         instruction += (
-            " Continue the master-timeline Shot already in progress from its current state; "
-            "do not replay its beginning: {}"
-        ).format(active_text)
+            " Continue the master-timeline Shot already in progress from its current state."
+        )
     return instruction
 
 
@@ -248,10 +241,13 @@ def _fallback_prompt(prompt, start_seconds, context_seconds):
 def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
                  segment_index=None, segment_count=None,
                  timeline_duration_seconds=None):
+    """Localize a master prompt with the author's pre-Aug-26 continuation clock.
+
+    The carried AV guide occupies the head of each raw H3 segment and therefore also
+    occupies the first ``context_seconds`` of the local prompt clock.  Ongoing Shot
+    prose is not replayed at every boundary; the sampled AV tail is authoritative.
+    """
     prompt = _strip_outer_code_fence(prompt)
-    master_end_seconds = end_seconds
-    if timeline_duration_seconds is not None:
-        master_end_seconds = min(master_end_seconds, timeline_duration_seconds)
     field_name, field = _timeline_field(prompt)
     _validate_reference_labels(prompt, field_name)
     if field is not None:
@@ -263,14 +259,15 @@ def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
         prefix = ""
         wrapped = False
 
-    all_matches = list(_SHOT.finditer(content))
-    if not all_matches:
+    first_shot = _SHOT.search(content)
+    if first_shot is None:
         return _fallback_prompt(prompt, start_seconds, context_seconds)
-    first_shot = all_matches[0]
+
     global_markers = list(_GLOBAL_INSTRUCTIONS.finditer(content))
     if len(global_markers) > 1:
         raise ValueError("H3 prompt must contain at most one [Global Instructions] marker")
     tail = global_markers[0] if global_markers else None
+    all_matches = list(_SHOT.finditer(content))
     if tail is not None and tail.start() < all_matches[-1].end():
         raise ValueError("[Global Instructions] must appear after the final Shot")
     body_end = tail.start() if tail is not None else len(content)
@@ -316,7 +313,7 @@ def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
                 shot for index, shot in enumerate(parsed)
                 if round(index * (segment_count - 1) / (len(parsed) - 1)) == segment_index
             ]
-        duration = master_end_seconds - start_seconds
+        duration = end_seconds - start_seconds
         shots = [
             (number, start_seconds + offset * duration / len(assigned), text)
             for offset, (number, _, text) in enumerate(assigned)
@@ -336,7 +333,7 @@ def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
         if last < len(starts) - 1:
             timeline_end = timeline_duration_seconds
             if timeline_end is None:
-                timeline_end = master_end_seconds
+                timeline_end = end_seconds
             if timeline_end <= starts[last]:
                 raise ValueError("H3 timeline must end after its final timestamped Shot")
             gap = len(starts) - last - 1
@@ -348,34 +345,16 @@ def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
             for start, (number, _, text) in zip(starts, parsed)
         ]
 
-    window_start_millis = _timestamp_millis(start_seconds)
-    window_end_millis = _timestamp_millis(master_end_seconds)
     selected = [
         (number, shot_start, text)
         for number, shot_start, text in shots
-        if window_start_millis <= _timestamp_millis(shot_start) < window_end_millis
+        if start_seconds <= shot_start < end_seconds
     ]
-    starts_with_new_shot = bool(
-        selected and _timestamp_millis(selected[0][1]) == window_start_millis)
-    active = None if starts_with_new_shot else next(
-        (
-            (number, shot_start, text)
-            for number, shot_start, text in reversed(shots)
-            if _timestamp_millis(shot_start) < window_start_millis
-        ),
-        None,
-    )
 
-    active_text = active[2] if active is not None else ""
-    guide_note = _guide_instruction(context_seconds) if context_seconds else ""
-    if start_seconds and active_text:
-        rendered = [_unguided_continuation(active_text)]
-    else:
-        rendered = []
-    shot_number_offset = len(rendered)
+    rendered = [_guide_instruction(context_seconds)] if context_seconds else []
     for index, (_, shot_start, text) in enumerate(selected):
-        shot_number = index + 1 + shot_number_offset
-        local_start = shot_start - start_seconds
+        shot_number = index + 1 + bool(context_seconds)
+        local_start = context_seconds + shot_start - start_seconds
         if shot_number == 1 and local_start == 0:
             marker = "[Shot 1]"
         else:
@@ -388,46 +367,24 @@ def slice_prompt(prompt, start_seconds, end_seconds, context_seconds=0.0,
             "Do not restart or repeat any action already shown."
         )
 
-    if start_seconds and prefix:
-        prefix = _KEYFRAME_ALIGNMENT.sub("", prefix).rstrip()
-    if field_name == "detailed_description" and prefix:
-        prefix = _scope_reference_prefix(
-            prefix, start_seconds, master_end_seconds, context_seconds,
-            end_seconds)
-
     parts = []
     if prefix:
         parts.append(prefix)
     timeline = " ".join(rendered)
     if wrapped:
-        if field_name == "integrated_multimodal_description":
-            common_intro = "{}\n{}".format(
-                _segment_scope(
-                    start_seconds, master_end_seconds, context_seconds,
-                    end_seconds),
-                common_intro,
-            ).strip()
         timeline_parts = [
-            value for value in (common_intro, global_tail, guide_note, timeline) if value
+            value for value in (common_intro, global_tail, timeline) if value
         ]
         parts.append("{}: {}".format(field_name, "\n\n".join(timeline_parts)))
         soundscape = _SOUNDSCAPE.search(prompt)
         if soundscape is not None:
-            parts.append(
-                "overall_soundscape: "
-                + _localize_audio(soundscape.group(1), "soundscape", start_seconds)
-            )
+            parts.append("overall_soundscape: " + soundscape.group(1).strip())
         music = _MUSIC.search(prompt)
         if music is not None:
-            parts.append(
-                "non_diegetic_music: "
-                + _localize_audio(music.group(1), "music", start_seconds)
-            )
+            parts.append("non_diegetic_music: " + music.group(1).strip())
     else:
         if common_intro:
             parts.append(common_intro)
-        if guide_note:
-            parts.append(guide_note)
         parts.append(timeline)
         if global_tail:
             parts.append(global_tail)

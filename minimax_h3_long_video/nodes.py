@@ -37,7 +37,7 @@ from .timeline import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 UPSCALE_SCHEMA_VERSION = 1
 LOOP_UPSCALE_SCHEMA_VERSION = 2
 
@@ -774,7 +774,7 @@ def _timeline_master_audio(ref_audios):
 
 
 def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, crf,
-                  source_audio=None, crossfade_frames=0):
+                  source_audio=None):
     temporary = path.with_name("{}.tmp-{}.mp4".format(path.stem, os.getpid()))
     total_frames = sum(segment.output_frames for segment in segments)
     if source_audio is None:
@@ -801,7 +801,6 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
             audio_stream = container.add_stream("aac", rate=sample_rate, layout="stereo")
             video_pts = 0
             audio_pts = 0
-            pending_images = None
 
             def write_images(images):
                 nonlocal video_pts
@@ -827,8 +826,7 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
                 for packet in audio_stream.encode(frame):
                     container.mux(packet)
 
-            for segment_index, (checkpoint, segment) in enumerate(
-                    zip(segment_paths, segments)):
+            for checkpoint, segment in zip(segment_paths, segments):
                 latent, _ = _load_segment(checkpoint)
                 if master_waveform is None:
                     images, audio = _decode_segment(
@@ -866,35 +864,7 @@ def _write_master(path, segment_paths, segments, vae, audio_vae, width, height, 
                 else:
                     output_audio = master_waveform[:, output_start:output_end]
 
-                if pending_images is not None:
-                    blend_frames = pending_images.shape[0]
-                    if output_images.shape[0] < 1:
-                        raise ValueError(
-                            "continuation segment has no delivered frame for video crossfade")
-                    output_anchor = output_images[:1].to(device="cpu").expand(
-                        blend_frames, -1, -1, -1)
-                    weights = torch.linspace(
-                        0.0, 1.0, blend_frames,
-                        dtype=output_anchor.dtype,
-                    ).reshape(-1, 1, 1, 1)
-                    write_images(
-                        pending_images * (1.0 - weights) + output_anchor * weights)
-                    pending_images = None
-
-                if crossfade_frames and segment_index + 1 < len(segments):
-                    next_blend_frames = min(
-                        int(crossfade_frames),
-                        segments[segment_index + 1].context_frames,
-                        output_images.shape[0],
-                    )
-                    if next_blend_frames:
-                        write_images(output_images[:-next_blend_frames])
-                        pending_images = output_images[-next_blend_frames:].detach().to(
-                            device="cpu", copy=True)
-                    else:
-                        write_images(output_images)
-                else:
-                    write_images(output_images)
+                write_images(output_images)
                 write_audio(output_audio)
 
             for packet in video_stream.encode(None):
@@ -981,9 +951,9 @@ def _long_reference_sampler_schema(node_id, display_name, description,
                 io.Int.Input("width", default=1344, min=32, max=4096, step=32),
                 io.Int.Input("height", default=768, min=32, max=4096, step=32),
                 io.Int.Input("length", default=720, min=24, max=86400, step=1,
-                             tooltip="Total timeline frames at 24 fps. Accepts either 720 or its H3-grid form 736 as 30 seconds."),
+                             tooltip="Exact delivered timeline frames at 24 fps. 720 frames = 30 seconds."),
                 io.Int.Input("max_raw_frames", default=124, min=73, max=362, step=17,
-                             tooltip="H3-grid segment value reversed to its intended duration when possible. 362 means a 15-second timeline window. AV guide frames and H3 padding are added internally."),
+                             tooltip="Strict H3-grid maximum for each raw segment, including the removable AV guide. With 39 context frames, 124 delivers at most 85 new frames per continuation."),
                 io.Combo.Input("context_frames", options=["22", "39"], default="22",
                                tooltip="Previous sampled AV latent generated as a guide at the start of each continuation segment. Guided frames are removed from the delivered video."),
                 io.Int.Input("noise_seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
@@ -1036,7 +1006,6 @@ def _long_reference_sampler_schema(node_id, display_name, description,
 
 class MiniMaxH3LongReferenceSampler(io.ComfyNode):
     continuation_context_mode = "guide"
-    video_crossfade_frames = 0
     use_timeline_master_audio = False
 
     @classmethod
@@ -1130,7 +1099,6 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             "max_raw_frames": max_raw_frames,
             "context_frames": context_frames,
             "continuation_context_mode": cls.continuation_context_mode,
-            "video_crossfade_frames": cls.video_crossfade_frames,
             "ref_audio_mode": ref_audio_mode,
             "master_audio_mode": (
                 "reference_audio_0" if cls.use_timeline_master_audio else "generated"),
@@ -1259,8 +1227,7 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
             _write_master(
                 master_path, segment_paths, segments, vae, audio_vae,
                 width, height, crf,
-                source_audio=master_source_audio,
-                crossfade_frames=cls.video_crossfade_frames)
+                source_audio=master_source_audio)
         else:
             _write_master(
                 master_path, segment_paths, segments, vae, audio_vae,
@@ -1277,8 +1244,7 @@ class MiniMaxH3LongReferenceSampler(io.ComfyNode):
 
 
 class MiniMaxH3LongTimelineAudioSampler(MiniMaxH3LongReferenceSampler):
-    continuation_context_mode = "guide_output_crossfade"
-    video_crossfade_frames = 4
+    continuation_context_mode = "author_2026_08_25_guide"
     use_timeline_master_audio = True
 
     @classmethod
