@@ -395,6 +395,112 @@ def _load_segment(path):
     return latent, metadata or {}
 
 
+def _uploaded_h3_av_checkpoints():
+    """Return input-relative H3 AV checkpoint names for the upload combo."""
+    input_root = Path(folder_paths.get_input_directory()).resolve()
+    if not input_root.exists():
+        return []
+    return sorted(
+        path.relative_to(input_root).as_posix()
+        for path in input_root.rglob("*.safetensors")
+        if path.is_file()
+    )
+
+
+class MiniMaxH3AVLatentUpload(io.ComfyNode):
+    """Upload and reconstruct the paired video/audio latent used by MiniMax H3."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3AVLatentUpload",
+            display_name="MiniMax H3 AV Latent Upload",
+            category="sampling/minimax/long video",
+            description=(
+                "Upload a .safetensors checkpoint exported by MiniMax H3 AV Latent Save. "
+                "The checkpoint contains both video and audio latents and can be connected "
+                "to a long sampler's optional initial_latent input. Select none for the first segment."
+            ),
+            inputs=[
+                io.Combo.Input(
+                    "checkpoint",
+                    options=["none"] + _uploaded_h3_av_checkpoints(),
+                    default="none",
+                    upload=io.UploadType.model,
+                    tooltip="Upload or select a MiniMax H3 AV .safetensors checkpoint from the ComfyUI input folder.",
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="av_latent"),
+                io.String.Output(display_name="checkpoint_name"),
+            ],
+        )
+
+    @classmethod
+    def validate_inputs(cls, checkpoint, **kwargs):
+        if not checkpoint or checkpoint == "none":
+            return True
+        if Path(checkpoint).suffix.lower() != ".safetensors":
+            return "MiniMax H3 AV checkpoint must use the .safetensors extension"
+        if not folder_paths.exists_annotated_filepath(checkpoint):
+            return "MiniMax H3 AV checkpoint does not exist: {}".format(checkpoint)
+        return True
+
+    @classmethod
+    def execute(cls, checkpoint):
+        if not checkpoint or checkpoint == "none":
+            return io.NodeOutput(None, "")
+        path = Path(folder_paths.get_annotated_filepath(checkpoint)).resolve()
+        latent, _ = _load_segment(path)
+        return io.NodeOutput(_cpu_latent(latent), checkpoint)
+
+
+class MiniMaxH3AVLatentSave(io.ComfyNode):
+    """Export a MiniMax H3 paired AV latent as a reusable safetensors file."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3AVLatentSave",
+            display_name="MiniMax H3 AV Latent Save",
+            category="sampling/minimax/long video",
+            description=(
+                "Save the last_latent from a MiniMax H3 long sampler as a downloadable "
+                ".safetensors file. Use that file as the next segment's initial_latent."
+            ),
+            is_output_node=True,
+            inputs=[
+                io.Latent.Input("av_latent"),
+                io.String.Input("filename_prefix", default="h3_av_latents/segment"),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="av_latent"),
+                io.String.Output(display_name="checkpoint_path"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, av_latent, filename_prefix):
+        video, audio = _streams(av_latent)
+        output_root = folder_paths.get_output_directory()
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, output_root, 1, 1)
+        file = "{}_{:05d}.safetensors".format(filename, counter)
+        path = Path(full_output_folder) / file
+        metadata = {
+            "format": "minimax_h3_av_latent_v1",
+            "video_shape": json.dumps(list(video.shape)),
+            "audio_shape": json.dumps(list(audio.shape)),
+        }
+        _save_segment(path, av_latent, metadata)
+        saved = ui.SavedResult(file, subfolder, io.FolderType.output)
+        return io.NodeOutput(
+            av_latent,
+            str(path),
+            ui={"files": [saved], "latents": [saved]},
+        )
+
+
 def _prepare_references(vae, audio_vae, width, height, frame_count, ref_image_size,
                         ref_images, ref_videos, ref_video_audios, ref_audios):
     ref_items = []
@@ -1821,6 +1927,8 @@ class MiniMaxH3TimelineAudioExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             MiniMaxH3LongTimelineAudioSampler,
+            MiniMaxH3AVLatentUpload,
+            MiniMaxH3AVLatentSave,
         ]
 
 

@@ -18,6 +18,7 @@ from minimax_h3_long_video import timeline
 from minimax_h3_long_video.nodes import (
     _add_continuation_guide, _expand_cache_name, _load_segment,
     _output_paths, _prepare_master_audio, _save_segment, _write_master,
+    MiniMaxH3AVLatentSave, MiniMaxH3AVLatentUpload,
     MiniMaxH3LongLatentUpscale,
     MiniMaxH3LongSegmentLoad, MiniMaxH3LongSegmentSave,
     MiniMaxH3LongUpscaleAssemble, MiniMaxH3LongUpscalePrepare,
@@ -42,6 +43,41 @@ class AudioVAE:
 
 
 class BackendTests(unittest.TestCase):
+    def test_h3_av_upload_and_save_schema(self):
+        upload_schema = MiniMaxH3AVLatentUpload.define_schema()
+        self.assertEqual(upload_schema.node_id, "MiniMaxH3AVLatentUpload")
+        self.assertEqual(upload_schema.inputs[0].upload, long_nodes.io.UploadType.model)
+        self.assertEqual(upload_schema.outputs[0].get_io_type(), "LATENT")
+
+        save_schema = MiniMaxH3AVLatentSave.define_schema()
+        self.assertEqual(save_schema.node_id, "MiniMaxH3AVLatentSave")
+        self.assertTrue(save_schema.is_output_node)
+        self.assertEqual(save_schema.outputs[0].get_io_type(), "LATENT")
+
+    def test_h3_av_latent_save_and_upload_roundtrip(self):
+        video = torch.randn((1, 24, 7, 4, 6))
+        audio = torch.randn((1, 32, 2, 11))
+        latent = {
+            "samples": long_nodes.comfy.nested_tensor.NestedTensor((video, audio))
+        }
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            output_root = root / "output"
+            input_root = root / "input"
+            output_root.mkdir()
+            input_root.mkdir()
+            with mock.patch.object(long_nodes.folder_paths, "get_output_directory", return_value=str(output_root)):
+                saved = MiniMaxH3AVLatentSave.execute(latent, "h3_av/segment")
+            saved_path = Path(saved[1])
+            self.assertTrue(saved_path.is_file())
+            uploaded_path = input_root / saved_path.name
+            uploaded_path.write_bytes(saved_path.read_bytes())
+            with mock.patch.object(long_nodes.folder_paths, "get_annotated_filepath", return_value=str(uploaded_path)):
+                loaded = MiniMaxH3AVLatentUpload.execute(uploaded_path.name)[0]
+            loaded_video, loaded_audio = long_nodes._streams(loaded)
+            self.assertTrue(torch.equal(video, loaded_video))
+            self.assertTrue(torch.equal(audio, loaded_audio))
+
     def test_schema_uses_cache_name_without_filename_prefix(self):
         schema = long_nodes.MiniMaxH3LongReferenceSampler.define_schema()
         input_ids = [input.id for input in schema.inputs]
